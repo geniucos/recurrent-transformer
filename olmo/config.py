@@ -58,6 +58,7 @@ __all__ = [
     "FSDPConfig",
     "SingleGPUConfig",
     "CheckpointType",
+    "CudaGraphMode",
 ]
 
 C = TypeVar("C", bound="BaseConfig")
@@ -212,7 +213,9 @@ class BlockType(StrEnum):
     A block similar to the sequential block with slightly different
     implementations of operations like attention to imitate the behavior of Llama.
     """
+    recurrent = "recurrent"
 
+    recurrent_autograd = "recurrent_autograd"
 
 class InitFnType(StrEnum):
     mitchell = "mitchell"
@@ -397,6 +400,12 @@ class ModelConfig(BaseConfig):
     max_sequence_length: int = 1024
     """
     The maximum input sequence length supported by the model.
+    """
+
+    bwd_mlp_chunks: int = 1
+    """
+    This is specifically for OLMoRecurrentBlockTiledFunction bwd pass; How many times do we split MLP recomputation
+    into chunks? The higher, the better memory and worse AMP caching (thus worse timing).
     """
 
     include_bias: bool = True
@@ -972,6 +981,18 @@ class ActivationCheckpointingStrategy(StrEnum):
     """
 
 
+class CudaGraphMode(StrEnum):
+    per_layer = "per_layer"
+    """
+    Use CUDA graphs per layer.
+    """
+
+    whole = "whole"
+    """
+    Use CUDA graphs for the whole model.
+    """
+
+
 @dataclass
 class TrainConfig(BaseConfig):
     """
@@ -1194,6 +1215,8 @@ class TrainConfig(BaseConfig):
     The number of instances passed to the model in a single forward-backward pass. You should set
     this as large as you can based on available GPU memory.
     """
+    
+    logit_microbatch_size: Optional[int] = None
 
     device_eval_batch_size: int = 16
     """
@@ -1255,6 +1278,11 @@ class TrainConfig(BaseConfig):
     compile: Optional[CompilerConfig] = None
     """
     Settings for compiling the model with ``torch.compile()``.
+    """
+
+    cuda_graph: Optional[CudaGraphMode] = None
+    """
+    CUDA graph mode to use. Can be ``per_layer`` or ``whole``. If ``None``, CUDA graphs are not used.
     """
 
     distributed_strategy: Optional[DistributedStrategy] = DistributedStrategy.fsdp

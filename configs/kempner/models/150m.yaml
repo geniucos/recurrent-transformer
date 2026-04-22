@@ -1,12 +1,6 @@
-device_train_microbatch_size: 32 # For H100 with adam
-
 model:
-  # 150m non-embedding params and 216m total params
   d_model: 1024
   n_heads: 16
   mlp_hidden_size: 4096
   n_layers: 12
-
-# Memory: 51GB
-# 300k tokens / sec or 2.3 batches / sec
-# ~3 hrs per run
+  bwd_mlp_chunks: 4

@@ -439,7 +439,6 @@ def alibi_attention_bias(seq_len: int, config: ModelConfig, device: torch.device
     # shape: (1, n_heads, seq_len, seq_len)
     return alibi_bias * (1.0 / (2 ** m.view(1, config.n_heads, 1, 1)))  # type: ignore
 
-
 class OLMoBlock(nn.Module):
     """
     A base class for transformer block implementations.
@@ -656,7 +655,11 @@ class OLMoBlock(nn.Module):
             # Apply rotary embeddings.
             q, k = self.rotary_emb(q, k)
 
-        if attention_bias is not None:
+        # patched BUG in olmo under layer_past;
+        if attention_bias is not None and (
+            self.config.alibi
+            or self.config.block_type not in (BlockType.recurrent, BlockType.recurrent_autograd)
+        ):
             # Resize and cast attention bias.
             # The current dtype of the attention bias might not match the dtype that the SDP attn function will
             # run in if AMP is enabled, and this can be a problem if some tokens are masked out due to padding
@@ -674,7 +677,7 @@ class OLMoBlock(nn.Module):
             v,
             attn_mask=attention_bias,
             dropout_p=0.0 if not self.training else self.config.attention_dropout,
-            is_causal=attention_bias is None,
+            is_causal=attention_bias is None, # this is actually a bug under generation when alibi is not used
             max_doc_len=max_doc_len,
             cu_doc_lens=cu_doc_lens,
         )
@@ -703,6 +706,10 @@ class OLMoBlock(nn.Module):
             return OLMoSequentialBlock(layer_id, config, cache)
         elif config.block_type == BlockType.llama:
             return OLMoLlamaBlock(layer_id, config, cache)
+        elif config.block_type == BlockType.recurrent:
+            return OLMoRecurrentBlockTiled(layer_id, config, cache)
+        elif config.block_type == BlockType.recurrent_autograd:
+            return OLMoRecurrentAutogradBlock(layer_id, config, cache)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
 
@@ -754,10 +761,13 @@ class OLMoSequentialBlock(OLMoBlock):
         else:
             raise NotImplementedError(self.config.init_fn)
 
-        init_normal(self.att_proj, std, cutoff_factor)
+        if hasattr(self, 'att_proj'): # this is because recurrent inherits it and may delete att_proj
+            init_normal(self.att_proj, std, cutoff_factor)
         init_normal(self.ff_proj, std, cutoff_factor)
+        # this is for when BlockRecurrent is used, to store the std and cutoff factor for the attention and feedforward output projections
+        self.std, self.cutoff_factor = std, cutoff_factor
 
-    def forward(
+    def _real_forward(
         self,
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
@@ -804,6 +814,7 @@ class OLMoSequentialBlock(OLMoBlock):
                 cu_doc_lens=cu_doc_lens,
             )
         else:
+            # att, cache = h, None
             att, cache = self.attention(
                 q,
                 k,
@@ -853,7 +864,567 @@ class OLMoSequentialBlock(OLMoBlock):
         x = og_x + x
 
         return x, cache
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        max_doc_len: Optional[int] = None,
+        cu_doc_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        with torch.autocast('cuda', enabled=True, dtype=self.config.precision):
+            out, cache = self._real_forward(x, attention_bias, layer_past, use_cache, max_doc_len, cu_doc_lens)
+        return out, cache
 
+class PreAttentionBlock(nn.Module):
+    def __init__(self, obj: OLMoSequentialBlock, should_do_norm_and_permute: bool = True):
+        super().__init__()
+        self.attn_norm = obj.attn_norm
+        self.kv_proj = obj.kv_proj
+        self.q_proj = obj.q_proj
+        self.clip_qkv = obj.config.clip_qkv
+        self.fused_dims = obj.fused_dims
+        self.norm_after = obj.config.norm_after
+
+        self.should_do_norm_and_permute = should_do_norm_and_permute
+        if self.should_do_norm_and_permute:
+            self.head_dim = obj.config.d_model // obj.config.n_heads
+            self.effective_n_kv_heads = obj.config.effective_n_kv_heads
+            self.n_heads = obj.config.n_heads
+            self.q_norm = obj.q_norm
+            self.k_norm = obj.k_norm
+
+    @torch.compile(dynamic=False)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_normed = self.attn_norm(x) if not self.norm_after else x # (B, L, D)
+        kv = self.kv_proj(x_normed)
+        q = self.q_proj(x_normed)
+        if self.clip_qkv is not None:
+            kv.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+            q.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+        k_init, v_init = kv.split(self.fused_dims[1:], dim=-1)
+
+        if self.should_do_norm_and_permute:
+            # normalize q, k_init and permute to (B, n_heads, L, head_dim)
+            if self.q_norm is not None and self.k_norm is not None:
+                dtype = k_init.dtype
+                q = self.q_norm(q).to(dtype=dtype)
+                k_init = self.k_norm(k_init).to(dtype=dtype)
+            B = x.shape[0]
+            k_init = k_init.view(B, -1, self.effective_n_kv_heads, self.head_dim).transpose(1, 2)
+            v_init = v_init.view(B, -1, self.effective_n_kv_heads, self.head_dim).transpose(1, 2)
+            q = q.view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
+        return q, k_init, v_init
+
+class PostAttentionBlock(nn.Module):
+    def __init__(self, obj: OLMoSequentialBlock):
+        super().__init__()
+        self.attn_norm = obj.attn_norm
+        self.ff_norm = obj.ff_norm
+        self.ff_proj = obj.ff_proj
+        self.act = obj.act
+        self.ff_out = obj.ff_out
+        self.dropout = obj.dropout
+        self.norm_after = obj.config.norm_after
+
+    def forward(self, x: torch.Tensor, att: torch.Tensor) -> torch.Tensor:
+        if self.norm_after:
+            att = self.attn_norm(att)
+        x = x + self.dropout(att)
+        og_x = x
+        if not self.norm_after:
+            x = self.ff_norm(x)
+        x = self.ff_out(self.act(self.ff_proj(x)))
+        if self.norm_after:
+            x = self.ff_norm(x)
+        x = self.dropout(x)
+        x = og_x + x
+        return x
+
+class OLMoRecurrentBlockBase(OLMoSequentialBlock):
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__(layer_id, config, cache) # initializations of:
+        # self.att_proj, self.ff_proj, self.attn_norm, self.ff_norm, self.final_kv_proj
+        del self.att_proj
+        self.q_proj = self.kv_proj = nn.Linear(
+            config.d_model, self.fused_dims[0], bias=config.include_bias, device=config.init_device
+        )
+        self.kv_proj = nn.Linear(
+            config.d_model, sum(self.fused_dims[1:]), bias=config.include_bias, device=config.init_device
+        )
+        self.pre_attention_block = PreAttentionBlock(self)
+        self.post_attention_block = PostAttentionBlock(self)
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        init_normal(self.q_proj, self.std, self.cutoff_factor)
+        init_normal(self.kv_proj, self.std, self.cutoff_factor)
+    
+    def init_from_sequential_block(self, sequential_block: OLMoSequentialBlock):
+        self.kv_proj.weight.data.copy_(sequential_block.att_proj.weight.data[self.fused_dims[0]:, :])
+        if sequential_block.att_proj.bias is not None:
+            self.kv_proj.bias.data.copy_(sequential_block.att_proj.bias.data[self.fused_dims[0]:])
+        
+        self.q_proj.weight.data.copy_(sequential_block.att_proj.weight.data[:self.fused_dims[0], :])
+        if sequential_block.att_proj.bias is not None:
+            self.q_proj.bias.data.copy_(sequential_block.att_proj.bias.data[:self.fused_dims[0]])
+    
+        self.ff_proj.weight.data.copy_(sequential_block.ff_proj.weight.data)
+        if sequential_block.ff_proj.bias is not None:
+            self.ff_proj.bias.data.copy_(sequential_block.ff_proj.bias.data)
+        
+        self.attn_out.weight.data.copy_(sequential_block.attn_out.weight.data)
+        if sequential_block.attn_out.bias is not None:
+            self.attn_out.bias.data.copy_(sequential_block.attn_out.bias.data)
+        
+        self.ff_out.weight.data.copy_(sequential_block.ff_out.weight.data)
+        if sequential_block.ff_out.bias is not None:
+            self.ff_out.bias.data.copy_(sequential_block.ff_out.bias.data)
+        
+        # self.attn_norm = sequential_block.attn_norm
+        # self.ff_norm = sequential_block.ff_norm
+        # if hasattr(sequential_block, 'k_norm'):
+        #     assert sequential_block.k_norm is not None
+        #     self.k_norm = sequential_block.k_norm
+        # if hasattr(sequential_block, 'q_norm'):
+        #     assert sequential_block.q_norm is not None
+        #     self.q_norm = sequential_block.q_norm
+
+    def _real_forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            "OLMoRecurrentBlockBase only holds shared weights for recurrent Modules; use block_type recurrent or recurrent_autograd."
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        max_doc_len: Optional[int] = None,
+        cu_doc_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        assert (layer_past is None) and (use_cache is False) and (max_doc_len is None) and (cu_doc_lens is None), \
+               "Recurrent block does not support layer_past, use_cache, max_doc_len, cu_doc_lens"
+        with torch.autocast('cuda', enabled=True, dtype=self.config.precision):
+            out = self._real_forward(x, attention_bias)
+        return out, None
+
+class OLMoRecurrentAutogradBlock(OLMoRecurrentBlockBase):
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__(layer_id, config, cache)
+
+    def _real_forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        outputs = []
+        B, L, D = x.shape
+        q, k_init, v_init = self.pre_attention_block(x)
+
+        final_k = [] # list of (B, n_heads, 1, head_dim)
+        final_v = [] # list of (B, n_heads, 1, head_dim)
+        head_dim = self.config.d_model // self.config.n_heads
+        kv_dim = head_dim * self.config.effective_n_kv_heads
+        
+        def shuffle_appropriately(k: torch.Tensor) -> torch.Tensor:
+            assert k.ndim == 3 and k.shape[0] == B and k.shape[2] == kv_dim
+            return k.view(B, -1, self.config.effective_n_kv_heads, head_dim).transpose(1, 2)
+        
+        def augment_cache(k, v):
+            if self.q_norm is not None and self.k_norm is not None:
+                dtype = k.dtype
+                k = self.k_norm(k).to(dtype=dtype)
+            final_k.append(shuffle_appropriately(k))
+            final_v.append(shuffle_appropriately(v))
+        
+        for t in range(L):
+            x_t = x[:, t:(t+1), :] # (B, 1, D)
+            q_t = q[:, :, t:(t+1), :] # (B, n_heads, 1, head_dim)
+            k_t = k_init[:, :, t:(t+1), :] # (B, effective_n_kv_heads, 1, head_dim)
+            v_t = v_init[:, :, t:(t+1), :] # (B, effective_n_kv_heads, 1, head_dim)
+            assert (x_t.shape== (B, 1, D)) and (q_t.shape == (B, self.config.n_heads, 1, head_dim))
+            assert k_t.shape == v_t.shape == (B, self.config.effective_n_kv_heads, 1, head_dim)
+            
+            # beginning of attention
+            curr_attention_bias = \
+                attention_bias[:, :, t:(t+1), :(t + 1)] if attention_bias is not None else \
+                torch.zeros((B, self.config.n_heads, 1, t + 1), dtype=k_t.dtype, device=k_t.device)
+
+            assert not self.config.rope, "RoPE is not supported for recurrent_autograd block"
+            assert self.config.effective_n_kv_heads == self.config.n_heads, \
+            "effective_n_kv_heads must be equal to n_heads for recurrent_autograd block"
+
+            big_k = torch.cat(final_k + [k_t], dim=-2) # (B, n_heads, t + 1, head_dim)
+            big_v = torch.cat(final_v + [v_t], dim=-2) # (B, n_heads, t + 1, head_dim)
+
+            # the following is equivalent to
+            # att_t = F.scaled_dot_product_attention(q_t, big_k, big_v, attn_mask=curr_attention_bias)
+
+            attn_weights = torch.matmul(big_k, q_t.transpose(-2, -1)) / math.sqrt(head_dim) # (B, n_heads, t + 1, 1)
+            attn_weights = attn_weights.transpose(-1, -2) + curr_attention_bias # (B, n_heads, 1, t + 1)
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+            att_t = torch.matmul(attn_weights, big_v) # (B, n_heads, 1, head_dim)
+
+            att_t = att_t.transpose(1, 2).contiguous().reshape(B, 1, D)
+            att_t = self.attn_out(att_t)
+            # attention fully computed
+
+            out_t = self.post_attention_block(x_t, att_t)
+            outputs.append(out_t)
+            assert att_t.shape == out_t.shape == (B, 1, D)
+
+            final_kv = self.kv_proj(self.pre_attention_block.attn_norm(out_t))
+            if self.config.clip_qkv is not None:
+                final_kv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
+            final_k_t, final_v_t = final_kv.split(self.fused_dims[1:], dim=-1)
+            assert final_k_t.shape == final_v_t.shape == (B, 1, kv_dim)
+            augment_cache(final_k_t, final_v_t)
+        
+        cat_outs = torch.cat(outputs, dim=1) # (B, T, D)
+        return cat_outs
+
+@torch.compile(dynamic=False)
+def block_attention_add(
+    att_0, max_logit_0, sum_scores_0,
+    k, v, q, attention_bias):
+    assert (k.shape == v.shape) and (k.shape[:-2] == q.shape[:-2]) and (k.shape[-1] == q.shape[-1])
+    n, m = q.shape[-2], k.shape[-2]
+    # q's shape: (B, n_heads, n, head_dim)
+    # (k, v)'s shape: (B, n_heads, m, head_dim)
+    # assert (attention_bias == None or attention_bias.shape[-2:] == (n, m)) # commented out for compilation
+    assert (att_0.shape[0] == n) and \
+            (max_logit_0.shape == (sum_scores_0.shape))
+
+    attn_weights = q @ k.transpose(-2, -1) # (B, n_heads, n, m)
+    if attention_bias is not None:
+        attn_weights += attention_bias
+    
+    max_logit = torch.max(max_logit_0.permute(1, 2, 0), attn_weights.max(dim=-1).values) # (B, n_heads, n)
+    attn_weights = torch.exp(attn_weights - max_logit.unsqueeze(-1)) # (B, n_heads, n, m)
+    att = attn_weights @ v # (B, n_heads, n, head_dim)
+
+    max_logit = max_logit.permute(2, 0, 1)
+    new_scaling = torch.exp(max_logit_0 - max_logit)
+    att_0 = att_0 * new_scaling.unsqueeze(-1) + att.permute(2, 0, 1, 3)
+    sum_scores_0 = sum_scores_0 * new_scaling + attn_weights.sum(dim=-1).permute(2, 0, 1)
+    return att_0, max_logit, sum_scores_0
+
+@torch.compile(fullgraph=True)
+def recompute_alphas(final_k, k_init, q, attention_bias):
+    alphas = (final_k.permute(1, 2, 0, 3) @ q.permute(1, 2, 3, 0))  # (B, n_heads, L, L)
+    alphas.diagonal(dim1=2, dim2=3).copy_(((q * k_init).sum(dim=-1).permute(1, 2, 0)))  # (B, n_heads, L)
+    if attention_bias is not None:
+        # assert attention_bias.shape == (1, block.config.n_heads, L, L)
+        alphas += attention_bias.permute(0, 1, 3, 2)  # (B, n_heads, L, L)
+    L = alphas.size(-1)
+    lower_mask = torch.ones((L, L), device=alphas.device, dtype=torch.bool).tril(diagonal=-1)
+    alphas.masked_fill_(lower_mask, float("-inf")) # (B, n_heads, L, L)
+    # ensure we do softmax in float32 to avoid numerical issues
+    alphas = torch.softmax(alphas, dim=-2, dtype=torch.float32).to(q.dtype)  # (B, n_heads, L, L), batch, head, key, query
+    return alphas
+
+
+@torch.compile(fullgraph=True)
+def recompute_atts(final_v, v_init, alphas):
+    # alphas: (B, n_heads, L, L) - batch, head, key, query
+    atts = torch.matmul(final_v.permute(1, 2, 3, 0), alphas).permute(3, 0, 1, 2)  # (L, B, n_heads, head_dim)
+    atts += (v_init - final_v) * alphas.diagonal(dim1=2, dim2=3).permute(2, 0, 1).unsqueeze(-1)
+    return atts
+
+
+@torch.compile(fullgraph=True)
+def mlp_batched_body(all_atts, x, block, dtype):
+    with torch.autocast('cuda', enabled=True, dtype=dtype):
+        all_atts = all_atts.transpose(0, 1).reshape(x.shape)
+        all_atts = block.attn_out(all_atts)
+        mlp_outs = block.post_attention_block(x, all_atts)
+    return mlp_outs    
+
+
+class OLMoRecurrentBlockTiledFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, attention_bias, block):
+        B, L, D = x.shape
+
+        head_dim = block.config.d_model // block.config.n_heads
+        kv_dim = head_dim * block.config.effective_n_kv_heads
+        scale = 1.0 / math.sqrt(head_dim)
+
+        q, k_init, v_init = block.pre_attention_block(x) # all (B, n_heads, L, head_dim)
+        q = q.permute(2, 0, 1, 3).contiguous() * scale # (L, B, n_heads, head_dim)
+        k_init = k_init.permute(2, 0, 1, 3) # (L, B, n_heads, head_dim)
+        
+        def shuffle_appropriately(k: torch.Tensor) -> torch.Tensor:
+            # k : (B, 1, kv_dim) -> (1, B, n_heads, head_dim)
+            assert k.ndim == 3 and k.shape[0] == B and k.shape[2] == kv_dim
+            return k.view(B, -1, block.config.effective_n_kv_heads, head_dim).permute(1, 0, 2, 3)
+        
+        # saved for backward pass
+        outs = []  # list of (B, 1, D)
+
+        # initialize attention state (atts, max_logit, sum_scores)
+        atts = v_init.permute(2, 0, 1, 3).to(x.dtype).contiguous() # (L, B, n_heads, head_dim)
+        max_logit = (k_init * q).sum(dim=-1)  # (L, B, n_heads)
+        if attention_bias is not None:
+            max_logit += attention_bias.diagonal(dim1=-2, dim2=-1).expand(B, -1, -1).permute(2, 0, 1)
+        sum_scores = torch.ones((L, B, block.config.n_heads), dtype=x.dtype, device=q.device) # (B, L, n_heads) - this is in high precision
+
+        # no longer needed now that I initialized atts, max_logit, sum_scores
+        del k_init, v_init
+
+        # cache for keys and values (L, B, n_heads, head_dim) - position along first axis for contiguous slicing
+        final_k = torch.empty((L, B, block.config.n_heads, head_dim), dtype=q.dtype, device=q.device)
+        final_v = torch.empty((L, B, block.config.n_heads, head_dim), dtype=q.dtype, device=q.device)
+
+        for t in range(L):
+            att_t = (atts[t:(t+1)] / sum_scores[t:(t+1)].unsqueeze(-1)).to(q.dtype) # (1, B, n_heads, head_dim)
+            x_t = x[:, t:(t+1), :]
+            assert (x_t.shape == (B, 1, D))
+
+            att_t = att_t.transpose(0, 1).reshape(B, 1, D) # (B, 1, D)
+            att_t = block.attn_out(att_t)
+            out_t = block.post_attention_block(x_t, att_t)
+            outs.append(out_t)
+            assert att_t.shape == out_t.shape == x_t.shape == (B, 1, D)
+
+            # compute final_kv
+            final_kv = block.kv_proj(block.pre_attention_block.attn_norm(out_t))
+            if block.config.clip_qkv is not None:
+                final_kv.clamp_(min=-block.config.clip_qkv, max=block.config.clip_qkv)
+            final_k_t, final_v_t = final_kv.split(block.fused_dims[1:], dim=-1)
+            if block.q_norm is not None and block.k_norm is not None:
+                dtype = final_k_t.dtype
+                final_k_t = block.k_norm(final_k_t).to(dtype=dtype)
+            final_k_t = shuffle_appropriately(final_k_t)
+            final_v_t = shuffle_appropriately(final_v_t)
+            assert final_k_t.shape == final_v_t.shape == (1, B, block.config.n_heads, head_dim)
+            # update cache for forward pass
+            final_k[t:(t+1)] = final_k_t
+            final_v[t:(t+1)] = final_v_t
+            
+            if t + 1 == L:
+                break
+            T = (t + 1) & -(t + 1) # largest power of 2 dividing t + 1
+            
+            # consider the contribution of last T kvs to next T qs
+            k_slice = final_k[(t+1-T):(t+1)].permute(1, 2, 0, 3)  # (B, n_heads, T, head_dim)
+            v_slice = final_v[(t+1-T):(t+1)].permute(1, 2, 0, 3)  # (B, n_heads, T, head_dim)
+            q_slice = q[t+1:(t+1+T)].permute(1, 2, 0, 3) # (B, n_heads, T, head_dim)
+            curr_s = slice(t+1, t+1+T)
+            atts[curr_s], max_logit[curr_s], sum_scores[curr_s] = block_attention_add(
+                atts[curr_s], max_logit[curr_s], sum_scores[curr_s],
+                k_slice,
+                v_slice,
+                q_slice,
+                attention_bias[:, :, t+1:(t+1+T), (t+1-T):(t+1)] if attention_bias is not None else None
+            )
+        
+        final_outs = torch.cat(outs, dim=1)
+        ctx.save_for_backward(x, final_outs)
+        ctx.block = block
+        ctx.dtype = q.dtype
+        ctx.attention_bias = attention_bias
+        return final_outs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        saved_list = ctx.saved_tensors
+        x, outs = saved_list[0], saved_list[1]
+        block = ctx.block
+        autocast_ctx = torch.autocast('cuda', enabled=True, dtype=ctx.dtype)
+        attention_bias = getattr(ctx, "attention_bias", None)  # (B, n_heads, L, L) or None
+
+        B, L, D = x.shape
+        head_dim = block.config.d_model // block.config.n_heads
+        kv_dim = head_dim * block.config.effective_n_kv_heads
+        scale = 1.0 / math.sqrt(head_dim)
+
+        def shuffle_appropriately(k: torch.Tensor) -> torch.Tensor:
+            # k : (B, 1, kv_dim) -> (1, B, n_heads, head_dim)
+            assert k.ndim == 3 and k.shape[0] == B and k.shape[2] == kv_dim
+            return k.view(B, -1, block.config.effective_n_kv_heads, head_dim).permute(1, 0, 2, 3)
+
+        x = x.detach().requires_grad_(True)
+        with autocast_ctx:
+            with torch.enable_grad():
+                q, k_init, v_init = block.pre_attention_block(x) # all (B, n_heads, L, head_dim)
+                q = q.permute(2, 0, 1, 3).contiguous() * scale # (L, B, n_heads, head_dim)
+                k_init = k_init.permute(2, 0, 1, 3).contiguous() # (L, B, n_heads, head_dim)
+                v_init = v_init.permute(2, 0, 1, 3).contiguous() # (L, B, n_heads, head_dim)
+
+        with autocast_ctx:
+            final_ks = [] # list of (1, B, n_heads, head_dim) - with grad_fns
+            final_vs = [] # list of (1, B, n_heads, head_dim) - with grad_fns
+            outs_detached = [] # list of (B, 1, D)
+            for t in range(L):
+                out_t = outs[:, t:(t+1), :].detach().requires_grad_(True)
+                outs_detached.append(out_t)
+                with torch.enable_grad():
+                    final_kv = block.kv_proj(block.pre_attention_block.attn_norm(out_t))
+                    if block.config.clip_qkv is not None:
+                        final_kv.clamp_(min=-block.config.clip_qkv, max=block.config.clip_qkv)
+                    final_k_t, final_v_t = final_kv.split(block.fused_dims[1:], dim=-1)
+                    if block.q_norm is not None and block.k_norm is not None:
+                        dtype = final_k_t.dtype
+                        final_k_t = block.k_norm(final_k_t).to(dtype=dtype)
+                    final_k_t = shuffle_appropriately(final_k_t)
+                    final_v_t = shuffle_appropriately(final_v_t)
+                assert final_k_t.shape == final_v_t.shape == (1, B, block.config.n_heads, head_dim)
+                # store for backward pass
+                final_ks.append(final_k_t)
+                final_vs.append(final_v_t)
+            final_k = torch.cat(list(map(lambda x: x.detach(), final_ks)), dim=0)  # (L, B, n_heads, head_dim)
+            final_v = torch.cat(list(map(lambda x: x.detach(), final_vs)), dim=0)  # (L, B, n_heads, head_dim)
+
+        # because of the blocking thing in the forward pass, we need to recompute the alphas and atts here
+        alphas = recompute_alphas(final_k, k_init, q, attention_bias)
+        atts = recompute_atts(final_v, v_init, alphas)
+
+        k_grads = torch.zeros(final_k.shape, dtype=x.dtype, device=final_k.device)  # (L, B, n_heads, head_dim)
+        v_grads = torch.zeros(final_v.shape, dtype=x.dtype, device=final_v.device)  # (L, B, n_heads, head_dim)
+        all_grads = [] # list of (B, 1, D)
+        gs = torch.empty((L, B, block.config.n_heads, head_dim), device=q.device, dtype=q.dtype)
+        g_dot_atts = torch.empty((L, B, block.config.n_heads), device=q.device, dtype=q.dtype)
+        # shuffle final_v to a better shape:
+        final_v = final_v.permute(1, 2, 0, 3).contiguous() # (B, n_heads, L, head_dim)
+
+        # do all MLPs in the same autocast context (to aid caching)
+        mlp_out_ts = {}
+        atts_with_grad = {}
+        def redo_forward_mlp_range(t_start, t_end):
+            mlp_out_ts.clear()
+            atts_with_grad.clear()
+            for t in range(t_end - 1, t_start - 1, -1):
+                atts_with_grad[t] = atts[t:(t+1)].detach()
+            with autocast_ctx:
+                with torch.enable_grad():
+                    for t in range(t_end - 1, t_start - 1, -1):
+                        if t >= 0:
+                            x_t = x[:, t:(t+1), :].detach().requires_grad_(False)
+                            atts_with_grad[t].requires_grad_(True)
+                            att_t_reshaped = atts_with_grad[t].transpose(0, 1).reshape(B, 1, D)
+                            att_t_reshaped = block.attn_out(att_t_reshaped)
+                            mlp_out_ts[t] = block.post_attention_block(x_t, att_t_reshaped)
+
+        shared_segment = (L + block.config.bwd_mlp_chunks - 1) // block.config.bwd_mlp_chunks
+        for t in range(L-1, -1, -1):
+            torch.autograd.backward(
+                (final_ks[t], final_vs[t]),
+                grad_tensors=(k_grads[t:(t+1)], v_grads[t:(t+1)])
+            ) # (1, B, n_heads, head_dim), (1, B, n_heads, head_dim)
+            
+            if not t in mlp_out_ts:
+                redo_forward_mlp_range(t - shared_segment + 1, t + 1)
+            # reverting the MLP computation
+            grad_to_propagate = grad_output[:, t:(t+1), :] + outs_detached[t].grad
+            g = torch.autograd.grad(
+                mlp_out_ts[t],
+                (atts_with_grad[t],),
+                grad_outputs=grad_to_propagate
+            )[0] # (1, B, n_heads, head_dim)
+            all_grads.append(grad_to_propagate)
+
+            # now I need to propagate att's grad to q, k, v, k_init, v_init
+            # O(1) ops
+            # g_dot_att = (atts[t].unsqueeze(-2) @ g.unsqueeze(-1)).squeeze(-1)  # (1, B, n_heads, 1), <att, g>
+            g_dot_atts[t:(t+1)] = (atts_with_grad[t] * g).sum(dim=-1) # (1, B, n_heads)
+            gs[t:(t+1)] = g # (1, B, n_heads, head_dim)
+
+            if t == 0:
+                continue
+            T = t & -t # largest power of 2 dividing t
+
+            # v_grads[:t] += alpha[:t] * g  # (t, B, n_heads, head_dim)
+            # contribution of g[t:t+T] to v_grads[t-T:t] -> v_grads[t-T:t] += alpha[t:t+T, t-T:t, :, :] * g[t:t+T]
+            if T > 1:
+                v_grads[t-T:t] += torch.matmul(
+                    alphas[:, :, t-T:t, t:t+T],
+                    gs[t:t+T].permute(1, 2, 0, 3)
+                ).permute(2, 0, 1, 3)
+            else:
+                v_grads[t-1] += alphas[:, :, t-1, t:(t+1)] * gs[t]
+
+            if T > 1:
+                alphas[:, :, t-T:t, t:t+T] *= (
+                    torch.matmul(final_v[:, :, t-T:t, :], gs[t:t+T].permute(1, 2, 3, 0)) - \
+                    g_dot_atts[t:t+T].permute(1, 2, 0).unsqueeze(-2)
+                ) # (B, n_heads, keys, queries)
+            else:
+                alphas[:, :, t-1, t] *= (final_v[:, :, t - 1, :] * gs[t]).sum(dim=-1) - g_dot_atts[t]
+
+            # gradients with respect to k_i
+            # k_grads[:t].add_(alpha_gvs * (q_t * scale))  # (t, B, n_heads, head_dim)
+            # contribution of g[t:t+T] to k_grads[t-T:t]
+            if T > 1:
+                k_grads[t-T:t] += torch.matmul(
+                    alphas[:, :, t-T:t, t:t+T],
+                    q[t:t+T].permute(1, 2, 0, 3)
+                ).permute(2, 0, 1, 3)
+            else:
+                k_grads[t-1] += alphas[:, :, t-1, t:(t+1)] * q[t]
+        
+        # release final_ks, final_vs, mlp_out_ts
+        del final_ks, final_vs, mlp_out_ts, final_v, k_grads, v_grads, atts_with_grad
+
+        # compute k_init_grads, v_init_grads and their influence on q_grads:
+        v_init_grad = alphas.diagonal(dim1=2, dim2=3).unsqueeze(-1).permute(2, 0, 1, 3) * gs # (L, B, n_heads, head_dim)
+        # gvinits = (v_init.permute(1,2,0,3).unsqueeze(-2) @ gs.permute(1, 2, 3, 0).unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        gvinits = (v_init * gs).sum(dim=-1) # (L, B, n_heads)
+        alpha_selves = alphas.diagonal(dim1=2, dim2=3).permute(2, 0, 1) * (gvinits - g_dot_atts) # (L, B, n_heads)
+        k_init_grad = alpha_selves.unsqueeze(-1) * q # (L, B, n_heads, head_dim)
+        q_grads = (alpha_selves.unsqueeze(-1)) * k_init # (L, B, n_heads, head_dim)
+        
+        del gs # no longer needed henceforth
+
+        # compute q_grads
+        alphas.diagonal(dim1=2, dim2=3).zero_()
+        q_grads += torch.matmul(
+            alphas.permute(0, 1, 3, 2),
+            final_k.permute(1, 2, 0, 3)
+        ).permute(2, 0, 1, 3)
+        del alphas, final_k
+
+        # propagate gradients from k_init, v_init, q to x/preAttentionBlock
+        torch.autograd.backward((q, k_init, v_init), grad_tensors=(q_grads, k_init_grad, v_init_grad))
+        del q_grads, k_init_grad, v_init_grad, q, k_init, v_init
+
+        # recompute MLP to (parallelly) update its params' grads
+        all_atts = atts
+        big_grads = torch.cat(list(reversed(all_grads)), dim=1)
+        del all_grads, atts
+        assert all_atts.requires_grad == False
+        assert x.requires_grad == True
+        with torch.enable_grad():
+            mlp_outs = mlp_batched_body(all_atts, x, block, ctx.dtype)
+        torch.autograd.backward(mlp_outs, grad_tensors=big_grads)
+        
+        return x.grad, None, None
+
+
+class OLMoRecurrentBlockTiled(OLMoRecurrentBlockBase):
+    """Checkpointed tiled recurrent attention (custom autograd); same parameters as ``OLMoRecurrentBlockBase``."""
+
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__(layer_id, config, cache)
+        assert not self.config.rope, "RoPE is not supported for recurrent block"
+        assert self.config.effective_n_kv_heads == self.config.n_heads, (
+            "effective_n_kv_heads must be equal to n_heads for recurrent block"
+        )
+
+    def _real_forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return OLMoRecurrentBlockTiledFunction.apply(x, attention_bias, self)
 
 class OLMoLlamaBlock(OLMoBlock):
     """
@@ -1010,7 +1581,7 @@ class OLMoLlamaBlock(OLMoBlock):
 
 
 class OLMoOutput(NamedTuple):
-    logits: torch.FloatTensor
+    logits: Optional[torch.FloatTensor]
     """
     A tensor of shape `(batch_size, seq_len, vocab_size)` representing the log probabilities
     for the next token *before* normalization via (log) softmax.
@@ -1024,6 +1595,11 @@ class OLMoOutput(NamedTuple):
     hidden_states: Optional[Tuple[torch.Tensor, ...]]
     """
     Hidden states from each block.
+    """
+
+    pre_logits: Optional[torch.Tensor]
+    """
+    Hidden state after final layer norm and before the logit projection.
     """
 
 
@@ -1292,6 +1868,8 @@ class OLMo(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        return_pre_logits: bool = False,
+        return_logits: bool = True,
         doc_lens: Optional[torch.Tensor] = None,
         max_doc_lens: Optional[Sequence[int]] = None,
     ) -> OLMoOutput:
@@ -1481,19 +2059,23 @@ class OLMo(nn.Module):
             # add final hidden state post-final-layernorm, following HuggingFace's convention
             all_hidden_states.append(x)
 
-        # Get logits.
-        # shape: (batch_size, seq_len or 1, vocab_size)
-        if self.config.weight_tying:
-            logits = F.linear(x, self.transformer.wte.weight, None)  # type: ignore
-        else:
-            logits = self.transformer.ff_out(x)  # type: ignore
-        if self.config.scale_logits:
-            logits.mul_(1 / math.sqrt(self.config.d_model))
+        pre_logits = x
+        logits: Optional[torch.Tensor] = None
+        if return_logits:
+            # Get logits.
+            # shape: (batch_size, seq_len or 1, vocab_size)
+            if self.config.weight_tying:
+                logits = F.linear(pre_logits, self.transformer.wte.weight, None)  # type: ignore
+            else:
+                logits = self.transformer.ff_out(pre_logits)  # type: ignore
+            if self.config.scale_logits:
+                logits.mul_(1 / math.sqrt(self.config.d_model))
 
         return OLMoOutput(
             logits=logits,
             attn_key_values=attn_key_values,
             hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
+            pre_logits=pre_logits if return_pre_logits else None,
         )
 
     def get_fsdp_wrap_policy(self, wrap_strategy: Optional[FSDPWrapStrategy] = None):

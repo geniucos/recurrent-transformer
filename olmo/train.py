@@ -35,6 +35,7 @@ from .config import (
     CheckpointType,
     DDPGradSyncMode,
     DistributedStrategy,
+    EvaluatorType,
     SchedulerUnits,
     ShardedCheckpointerType,
     SpeedMonitorConfig,
@@ -466,7 +467,7 @@ class Trainer:
             raise NotImplementedError(checkpoint_type)
 
         # Zero-gradients to avoid gathering them.
-        self.optim.zero_grad(set_to_none=True)
+        self.optim.zero_grad(set_to_none=False)
 
         # Flush data indices file.
         # TODO: upload the indices files?
@@ -557,7 +558,7 @@ class Trainer:
         sharded_checkpointer: Optional[ShardedCheckpointerType] = None,
     ):
         # Zero-gradients to avoid gathering them.
-        self.optim.zero_grad(set_to_none=True)
+        self.optim.zero_grad(set_to_none=False)
         checkpointer = build_sharded_checkpointer(self.cfg, name=sharded_checkpointer)
         trainer_state = checkpointer.restore_checkpoint(
             load_path,
@@ -595,7 +596,7 @@ class Trainer:
         load_trainer_state: bool = True,
     ):
         # Zero-gradients to avoid gathering them.
-        self.optim.zero_grad(set_to_none=True)
+        self.optim.zero_grad(set_to_none=False)
         checkpointer = FullCheckpointer(self.cfg)
         trainer_state = checkpointer.restore_checkpoint(
             load_path,
@@ -757,6 +758,7 @@ class Trainer:
                 z_loss = z_loss.view(batch["input_ids"].shape[0], -1)
         return ce_loss, z_loss, logits
 
+    
     def train_micro_batch(
         self, micro_batch: Dict[str, Any], batch_size_in_tokens: int
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -779,6 +781,84 @@ class Trainer:
         del logits
 
         return loss, ce_loss, z_loss
+
+    def train_micro_batch_memeff(
+        self, micro_batch: Dict[str, Any], batch_size_in_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        autocast_device = "mps" if self.device.type == "mps" else "cuda"
+        with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+            output = self.dist_model(
+                input_ids=micro_batch["input_ids"],
+                attention_mask=micro_batch.get("attention_mask"),
+                attention_bias=micro_batch.get("attention_bias"),
+                doc_lens=micro_batch.get("doc_lens"),
+                max_doc_lens=micro_batch.get("max_doc_lens"),
+                return_pre_logits=True,
+                return_logits=False,
+            )
+            pre_logits = output.pre_logits
+            assert pre_logits is not None
+
+        # Detach so we can accumulate gradients at the pre-logit boundary.
+        pre_logits_detached = pre_logits.detach().requires_grad_(True)
+
+        # Prepare labels for loss computation.
+        labels = self.get_labels(micro_batch)
+        batch_size = micro_batch["input_ids"].shape[0]
+        logit_microbatch_size = min(self.cfg.logit_microbatch_size, batch_size)
+
+        # In case this helps with memory utilization.
+        del micro_batch
+
+        ce_loss_total = torch.tensor(0.0, device=self.device)
+        z_loss_total = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
+
+        for start in range(0, batch_size, logit_microbatch_size):
+            end = min(start + logit_microbatch_size, batch_size)
+            pre_logits_chunk = pre_logits_detached[start:end]
+            labels_chunk = labels[start:end]
+
+            with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                if self.cfg.model.weight_tying:
+                    logits = F.linear(pre_logits_chunk, self.model.transformer.wte.weight, None)  # type: ignore
+                else:
+                    logits = self.model.transformer.ff_out(pre_logits_chunk)  # type: ignore
+                if self.cfg.model.scale_logits:
+                    logits.mul_(1 / math.sqrt(self.cfg.model.d_model))
+
+                logits_for_loss = logits[..., :-1, :].contiguous()
+                logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
+                labels_for_loss = labels_chunk.view(-1)
+                ce_loss, z_loss = self.loss_fn(
+                    logits_for_loss,
+                    labels_for_loss,
+                    ignore_index=-100,
+                    reduction="sum",
+                    compute_z_loss=self.cfg.softmax_auxiliary_loss,
+                )
+
+            ce_loss_total += ce_loss.detach()
+            if z_loss is not None:
+                assert z_loss_total is not None
+                z_loss_total += z_loss.detach()
+
+            loss = ce_loss if z_loss is None else ce_loss + z_loss
+            loss = loss / batch_size_in_tokens
+            loss.backward()
+            del loss, ce_loss, z_loss, logits_for_loss, logits, labels_for_loss
+
+        assert pre_logits_detached.grad is not None
+        pre_logits.backward(pre_logits_detached.grad)
+
+        ce_loss_total = ce_loss_total / batch_size_in_tokens
+        if self.cfg.softmax_auxiliary_loss:
+            assert z_loss_total is not None
+            z_loss_total = z_loss_total / batch_size_in_tokens
+            loss = ce_loss_total + z_loss_total
+        else:
+            loss = ce_loss_total
+
+        return loss, ce_loss_total, z_loss_total
 
     def train_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Split into micro-batches.
@@ -808,21 +888,26 @@ class Trainer:
             output_hooks += self._setup_module_output_save_hooks(micro_batch_idx)
 
             with grad_sync_context():
-                autocast_device = "mps" if self.device.type == "mps" else "cuda"
-                with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
-                    # Run forward pass.
-                    loss, ce_loss, z_loss = self.train_micro_batch(micro_batch, batch_size_in_tokens)
+                if self.cfg.logit_microbatch_size is not None:
+                    loss, ce_loss, z_loss = self.train_micro_batch_memeff(
+                        micro_batch, batch_size_in_tokens
+                    )
+                else:
+                    autocast_device = "mps" if self.device.type == "mps" else "cuda"
+                    with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                        # Run forward pass.
+                        loss, ce_loss, z_loss = self.train_micro_batch(micro_batch, batch_size_in_tokens)
 
-                    # Update overall CE batch loss.
-                    ce_batch_loss += ce_loss.detach()
+                    # Run backward pass.
+                    loss.backward()
 
-                    # Update overall Z batch loss.
-                    if z_loss is not None:
-                        assert z_batch_loss is not None
-                        z_batch_loss += z_loss.detach()
+                # Update overall CE batch loss.
+                ce_batch_loss += ce_loss.detach()
 
-                # Run backward pass.
-                loss.backward()
+                # Update overall Z batch loss.
+                if z_loss is not None:
+                    assert z_batch_loss is not None
+                    z_batch_loss += z_loss.detach()
 
             # Remove output hooks
             for hook in output_hooks:
@@ -843,13 +928,14 @@ class Trainer:
             metrics["train/masked_instances_local_rank"] = (~instance_mask).sum().item()
 
         # Zero-gradients.
-        self.optim.zero_grad(set_to_none=True)
+        self.optim.zero_grad(set_to_none=False)
 
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
 
         # Run forward-backward pass.
         ce_batch_loss, z_batch_loss = self.train_batch(batch)
+        torch.cuda.synchronize()
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -916,12 +1002,83 @@ class Trainer:
 
         return metrics
 
-    def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
-        with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
-            ce_loss, _, logits = self.model_forward(batch, loss_reduction="none")
-        return ce_loss.mean(dim=-1), logits
+    def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.cfg.logit_microbatch_size is not None:
+            return self.eval_batch_memeff(batch)
+        else:
+            with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
+                ce_loss, _, logits = self.model_forward(batch, loss_reduction="none")
+            return ce_loss.mean(dim=-1), logits
+
+    def eval_batch_memeff(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Memory-efficient evaluation that processes logits in micro-batches."""
+        autocast_device = "mps" if self.device.type == "mps" else "cuda"
+        
+        # Get pre_logits without computing full logits
+        with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+            output = self.dist_model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch.get("attention_mask"),
+                attention_bias=batch.get("attention_bias"),
+                doc_lens=batch.get("doc_lens"),
+                max_doc_lens=batch.get("max_doc_lens"),
+                return_pre_logits=True,
+                return_logits=False,
+            )
+            pre_logits = output.pre_logits
+            assert pre_logits is not None
+
+        # Prepare labels
+        labels = self.get_labels(batch)
+        batch_size = batch["input_ids"].shape[0]
+        logit_microbatch_size = min(self.cfg.logit_microbatch_size, batch_size)
+        
+        # Accumulate results
+        ce_losses_per_instance = []
+        
+        # Process in chunks
+        for start in range(0, batch_size, logit_microbatch_size):
+            end = min(start + logit_microbatch_size, batch_size)
+            pre_logits_chunk = pre_logits[start:end]
+            labels_chunk = labels[start:end]
+            
+            with torch.autocast(autocast_device, enabled=True, dtype=self.cfg.autocast_precision):
+                # Compute logits for this chunk
+                if self.cfg.model.weight_tying:
+                    logits_chunk = F.linear(pre_logits_chunk, self.model.transformer.wte.weight, None)  # type: ignore
+                else:
+                    logits_chunk = self.model.transformer.ff_out(pre_logits_chunk)  # type: ignore
+                if self.cfg.model.scale_logits:
+                    logits_chunk.mul_(1 / math.sqrt(self.cfg.model.d_model))
+                
+                # Compute loss for this chunk
+                logits_for_loss = logits_chunk[..., :-1, :].contiguous()
+                logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
+                labels_for_loss = labels_chunk.view(-1)
+                ce_loss_chunk, _ = self.loss_fn(
+                    logits_for_loss,
+                    labels_for_loss,
+                    ignore_index=-100,
+                    reduction="none",
+                    compute_z_loss=False,
+                )
+                # Reshape to (chunk_size, seq_len)
+                ce_loss_chunk = ce_loss_chunk.view(end - start, -1)
+                ce_losses_per_instance.append(ce_loss_chunk.mean(dim=-1))
+        
+        # Concatenate results
+        ce_loss = torch.cat(ce_losses_per_instance, dim=0)
+        
+        return ce_loss, None  # Never materialize full logits tensor
 
     def eval_step(self, batch: Dict[str, Any], evaluator: Evaluator) -> None:
+        # Only support LM evaluators with memory-efficient mode
+        if self.cfg.logit_microbatch_size is not None and evaluator.type != EvaluatorType.lm:
+            raise ValueError(
+                f"Memory-efficient evaluation (logit_microbatch_size) only supports EvaluatorType.lm, "
+                f"but got {evaluator.type}"
+            )
+        
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
 
@@ -1014,10 +1171,10 @@ class Trainer:
             return False
 
     def should_eval_this_step(self) -> bool:
-        assert self.cfg.eval_interval is not None or self.cfg.eval_count_log_scale is not None
+        # assert self.cfg.eval_interval is not None or self.cfg.eval_count_log_scale is not None
         if self.cfg.eval_interval is not None:
             return self.global_step % self.cfg.eval_interval == 0
-        else:
+        elif self.cfg.eval_count_log_scale is not None:
             # assert type(self.cfg.max_duration) == int
             if type(self.cfg.max_duration) == int:
                 max_duration = self.cfg.max_duration
@@ -1044,8 +1201,11 @@ class Trainer:
 
     def eval(self) -> Dict[str, Any]:
         # Zero gradients and set model to 'eval' mode.
-        self.optim.zero_grad(set_to_none=True)
-        self.dist_model.eval()
+        self.optim.zero_grad(set_to_none=False)
+        if self.cfg.cuda_graph is None:
+            self.dist_model.eval()
+        else:
+            print("to actually use CUDA graphs, we do not toggle the model to eval mode")
 
         eval_metrics = {}
         for evaluator in self.evaluators:
@@ -1244,7 +1404,6 @@ class Trainer:
                     # overhead. So for now I'm putting these assertions here so if the assumption is violated it will
                     # fail loudly.
                     batch_size, seq_len = batch["input_ids"].shape
-                    # print(batch['input_ids'][:5], flush=True)
                     assert seq_len == self.cfg.model.max_sequence_length
                     assert batch_size == self.cfg.device_train_batch_size
                     global_batch_size = batch_size * get_world_size()  # assumes batch size equal across ranks

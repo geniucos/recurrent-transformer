@@ -1,0 +1,6 @@
+model:
+  d_model: 1440
+  n_heads: 16
+  mlp_hidden_size: 5760
+  n_layers: 12
+  bwd_mlp_chunks: 8

@@ -1266,11 +1266,12 @@ def get_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict[str, Any]]
 
     # Validate that we've considered every parameter
     inter_params = decay & no_decay
-    union_params = decay | no_decay
+    union_params = set([all_params[fpn].data_ptr() for fpn in (decay | no_decay)])
+    all_params_values = set([p.data_ptr() for p in all_params.values()])
     assert len(inter_params) == 0, f"parameters {inter_params} made it into both decay/no_decay sets!"
     assert (
-        len(all_params.keys() - union_params) == 0
-    ), f"parameters {all_params.keys() - union_params} were not separated into either decay/no_decay set!"
+        len(all_params_values - union_params) == 0
+    ), f"parameters {all_params_values - union_params} were not separated into either decay/no_decay set!"
 
     # Create the pytorch optimizer groups.
     decay_sorted = sorted(list(decay))

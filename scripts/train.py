@@ -66,6 +66,9 @@ def main(cfg: TrainConfig) -> None:
 
     barrier()
 
+    # set the cache size limit for dynamo
+    torch._dynamo.config.cache_size_limit = 13
+
     # Set CUDA device.
     if torch.cuda.is_available():
         torch.cuda.set_device(f"cuda:{get_local_rank()}")
@@ -77,7 +80,7 @@ def main(cfg: TrainConfig) -> None:
         device = torch.device("cpu")
 
     # Fill some configuration options.
-    cfg.model.precision = cfg.precision
+    cfg.model.precision = cfg.autocast_precision
     cfg.device_train_batch_size = cfg.global_train_batch_size // get_world_size()
     assert cfg.device_train_batch_size is not None  # for mypy
     cfg.device_train_grad_accum = cfg.device_train_batch_size // cfg.device_train_microbatch_size
@@ -132,6 +135,9 @@ def main(cfg: TrainConfig) -> None:
     train_loader = build_train_dataloader(cfg)
 
     # Construct evaluators.
+    if cfg.cuda_graph:
+        cfg.device_eval_batch_size = cfg.device_train_batch_size
+        log.info(f"Setting device_eval_batch_size to {cfg.device_train_batch_size} for CUDA Graph evaluation")
     evaluators = build_evaluators(cfg, device)
     barrier()
 
@@ -223,6 +229,11 @@ def main(cfg: TrainConfig) -> None:
         if olmo_model is None:
             raise OLMoConfigurationError("Model initialization failed.")
         olmo_model = olmo_model.to(device)
+        if cfg.cuda_graph:
+            log.info("Capturing model CUDA Graph...")
+            from olmo.efficient_utils import cuda_capture_model
+            cuda_capture_model(olmo_model, cfg)
+            log.info("Model CUDA Graph captured")
         dist_model = SingleAccelerator(olmo_model)
 
     # when param_init_fn is None, FSDP will call reset_parameters() automatically

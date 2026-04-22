@@ -1,0 +1,38 @@
+distributed_strategy: single
+model:
+  init_device: cuda
+  rope: false
+  alibi: true
+  block_type: recurrent
+  max_sequence_length: 512
+compile: null
+cuda_graph: whole
+# activation_checkpointing: whole_layer
+
+eval_interval: null
+eval_count_log_scale: 10
+
+sweep:
+  - device_train_microbatch_size: 512
+    global_train_batch_size: 512
+    logit_microbatch_size: 2
+    eval_subset_num_batches: 62
+    num_passes: 1
+    wandb:
+      group: recurrent_tiled_release_150m_512
+    optimizer:
+      name: adamw
+      learning_rate: [1e-3, 3.16e-3, 1e-2]
+      beta_0: 0.9
+      beta_1: [0.95, 0.99]
+      eps: 1.0e-8
+      decouple_weight_decay: true
+      weight_decay: 0.0
+      decay_norm_and_bias: true
+      decay_embeddings: true
+      metrics_log_interval: 100
+    scheduler:
+      name: "cosine_with_warmup"
+      t_warmup: 5000
+    max_duration: 12500
+    stop_at: 12500

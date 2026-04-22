@@ -1,247 +1,144 @@
-<div align="center">
-  <!-- <img src="https://github.com/allenai/OLMo/assets/8812459/774ac485-a535-4768-8f7c-db7be20f5cc3" width="300"/> -->
-  <img src="https://allenai.org/olmo/olmo-7b-animation.gif" alt="OLMo Logo" width="800" style="margin-left:'auto' margin-right:'auto' display:'block'"/>
-  <br>
-  <br>
-  <h1>OLMo: Open Language Model</h1>
-</div>
-<p align="center">
-  <a href="https://github.com/allenai/OLMo/blob/main/LICENSE">
-    <img alt="GitHub License" src="https://img.shields.io/github/license/allenai/OLMo">
-  </a>
-  <a href="https://github.com/allenai/OLMo/releases">
-    <img alt="GitHub release" src="https://img.shields.io/github/release/allenai/OLMo.svg">
-  </a>
-  <a href="https://arxiv.org/pdf/2501.00656.pdf">
-    <img alt="Paper URL" src="https://img.shields.io/badge/arxiv-2402.00838-blue">
-  </a>
-  <a href="https://playground.allenai.org">
-    <img alt="Playground" src="https://img.shields.io/badge/Ai2-Playground-F0529C">
-  </a>
-  <a href="https://discord.gg/sZq3jTNVNG">
-    <img alt="Discord" src="https://img.shields.io/badge/Discord%20-%20blue?style=flat&logo=discord&label=Ai2&color=%235B65E9">
-  </a>
-</p>
+# Recurrent OLMo
 
-OLMo is a repository for training and using AI2's state-of-the-art open language models. It is designed by scientists, for scientists.
+A fork of [OLMo](https://github.com/allenai/OLMo) that adds **block-recurrent transformer** layers. Each recurrent block recomputes its keys and values from the previous timestep's output (rather than from the original input), making attention structurally causal without a causal mask.
 
-## Installation
+Two recurrent block types are provided:
 
-First, install [PyTorch](https://pytorch.org) following the instructions specific to your operating system.
+| `block_type` | Implementation | Notes |
+|---|---|---|
+| `recurrent` | Tiled kernel with a custom `torch.autograd.Function` (`OLMoRecurrentBlockTiledFunction`) | Production path. O(L log L)tiled forward; memory-efficient backward via chunked MLP recomputation (`bwd_mlp_chunks`). |
+| `recurrent_autograd` | Plain PyTorch loop (`OLMoRecurrentAutogradBlock`) | Reference implementation. Numerically equivalent to `recurrent`; used for correctness verification. |
 
-For training and fine-tuning, we recommend installing from source:
+The standard OLMo block types (`sequential`, `llama`) are unchanged and can be used normally.
+
+## Setup
 
 ```bash
-git clone https://github.com/allenai/OLMo.git
-cd OLMo
-pip install -e .[all]
-```
-You can also install from PyPI with:
-```bash
-pip install ai2-olmo
+conda create -n recurrent python=3.11
+conda activate recurrent
+pip install -e .
 ```
 
-## Pretraining
+The C4/T5 tokenized dataset is expected at the path configured in `configs/kempner/base-c4-t5.yaml` (`data.paths`). Adjust this to point to your local copy.
 
-OLMo pretraining follows a two-stage training procedure.
-In the first stage, we train on large amounts of mostly web-based data: [OLMo-mix-1124](https://huggingface.co/datasets/allenai/olmo-mix-1124)
-In the second stage, we train on a smaller amount of high-quality, targeted data: [Dolmino-mix-1124](https://huggingface.co/datasets/allenai/dolmino-mix-1124)
+## Training
 
-You can find *all* the checkpoints, at minimum every 1000 training steps in OLMo core and Hugging Face format:
+Training uses the standard OLMo entrypoint. A base config plus a model-size overlay defines the architecture; a sweep YAML adds recurrent-specific overrides.
 
-
-| Variant         | OLMo Format (Stage 1)                                                                                         | OLMo Format (Stage 2) | Hugging Face Format                                                               |
-|----------------|-----------------------------------------------------------------------------------------------------|--------|----------------------------------------------------------------------------------|
-| **OLMo-2 1B**  | [OLMo-2 1B](https://github.com/allenai/OLMo/blob/main/configs/official-0425/OLMo-2-0425-1B.csv)     | [OLMo-2 1B](https://github.com/allenai/OLMo/blob/main/configs/official-0425/OLMo-2-0425-1B-stage2.csv)      | [Hugging Face for the 1B variant](https://huggingface.co/allenai/OLMo-2-0425-1B)  |
-| **OLMo-2 7B**  | [OLMo-2 7B](https://github.com/allenai/OLMo/blob/main/configs/official-1124/OLMo-2-1124-7B.csv)     | [OLMo-2 7B](https://github.com/allenai/OLMo/blob/main/configs/official-1124/OLMo-2-1124-7B-stage2.csv)      | [Hugging Face for the 7B variant](https://huggingface.co/allenai/OLMo-2-1124-7B)  |
-| **OLMo-2 13B** | [OLMo-2 13B](https://github.com/allenai/OLMo/blob/main/configs/official-1124/OLMo-2-1124-13B.csv)   | [OLMo-2 13B](https://github.com/allenai/OLMo/blob/main/configs/official-1124/OLMo-2-1124-13B-stage2.csv)       | [Hugging Face for the 13B variant](https://huggingface.co/allenai/OLMo-2-1124-13B) |
-| **OLMo-2 32B** | [OLMo-2 32B](https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo2-0325-32B.csv)   | [OLMo-2 32B](https://github.com/allenai/OLMo-core/blob/main/src/scripts/official/OLMo-2-0325-32B-stage2.csv) | [Hugging Face for the 32B variant](https://huggingface.co/allenai/OLMo-2-0325-32B) |
-
-> Note: The 32B variant was trained on our new trainer. To train or fine-tune OLMo-2 32B, visit [OLMo-core](https://github.com/allenai/OLMo-core).
-
-### Steps to reproduce
-
-To reproduce any of the training processes described below, run this:
+**Single-GPU example** (150M params, seq_len=512, recurrent blocks):
 
 ```bash
-torchrun --nproc_per_node=8 scripts/train.py {path_to_train_config}
+export CHECKPOINTS_PATH=/path/to/checkpoints
+
+python scripts/train.py \
+    configs/kempner/base-c4-t5.yaml+configs/kempner/models/150m.yaml \
+    --model.block_type=recurrent \
+    --model.rope=false \
+    --model.alibi=true \
+    --model.max_sequence_length=512 \
+    --model.init_device=cuda \
+    --compile=null \
+    --cuda_graph=whole \
+    --global_train_batch_size=512 \
+    --device_train_microbatch_size=512 \
+    --distributed_strategy=single \
+    --run_name=recurrent_150m_test
 ```
 
-For the training config, use any of the configs listed below.
-
-If you want to override any of the settings in the training config without having to write a new config every time,
-you can do this:
+**SLURM sweep** (hyperparameter grid via `--array`):
 
 ```bash
-torchrun --nproc_per_node=8 scripts/train.py {path_to_train_config} \
-  --setting1=value \
-  --setting2=value \
-  --setting3.subsetting1=value
+# Edit scripts/kempner/launch_sweep.sh to set your account, partition, and paths.
+# Adjust --array to match the number of grid points in the sweep config.
+sbatch scripts/kempner/launch_sweep.sh
 ```
 
-The training configs below refer to training data that gets streamed in live over HTTP.
-To reproduce at large scale, we recommend downloading the files locally and changing the paths to point to your
-local file system.
+See `sweep_recurrent_150m_512.yaml` for a sweep config example. The sweep runner (`scripts/kempner/run_sweep.py`) expands the grid and maps `SLURM_ARRAY_TASK_ID` to a specific hyperparameter combination.
 
-#### To run on Mac silicon devices:
+### Key config options
+
+| Config field | Values | Description |
+|---|---|---|
+| `model.block_type` | `sequential`, `llama`, `recurrent`, `recurrent_autograd` | Block implementation. |
+| `model.alibi` | `true` / `false` | ALiBi positional encoding. Recurrent blocks support ALiBi; they do **not** support RoPE (`model.rope` must be `false`). |
+| `model.bwd_mlp_chunks` | integer (default 1) | Chunks for MLP recomputation in the tiled backward pass. Higher = less memory, slightly slower. 4–8 is typical. |
+| `cuda_graph` | `null`, `per_layer`, `whole` | CUDA graph capture mode. `whole` captures all layers in one graph (best throughput for fixed shapes). |
+| `compile` | `null` or compile config | `torch.compile` settings. Set to `null` when using `cuda_graph`. |
+| `model.n_kv_heads` | integer | Must equal `model.n_heads` for recurrent blocks (GQA is not supported). |
+
+### Model sizes
+
+Model-size overlays are provided in `configs/kempner/models/`. All configs target roughly the stated non-embedding parameter count at different depth/width trade-offs:
+
+| Config | d_model | n_heads | mlp_hidden_size | n_layers | bwd_mlp_chunks |
+|---|---|---|---|---|---|
+| **150m.yaml** | 1024 | 16 | 4096 | 12 | 4 |
+| **150m_6.yaml** | 1408 | 22 | 5632 | 6 | 6 |
+| **300m.yaml** | 1024 | 16 | 4096 | 24 | 8 |
+| **300m_12.yaml** | 1408 | 22 | 5632 | 12 | 8 |
+| **300m_6.yaml** | 2048 | 32 | 8192 | 6 | 8 |
+
+## Verifying correctness
+
+`debug_test_recurrent.py` compares the `recurrent` (tiled) block against the `recurrent_autograd` (reference) block by initializing both from the same sequential weights and comparing logits, loss, and per-parameter gradient R2.
+
 ```bash
-python scripts/train.py {path_to_train_config}
+# Basic run (all 4 alibi x norm_after configs, quiet output)
+python debug_test_recurrent.py
+
+# Verbose per-parameter breakdown
+python debug_test_recurrent.py -v
+
+# Also test the CUDA-graphed path
+python debug_test_recurrent.py --cuda-capture
+
+# Forward-only (skip backward/gradient comparison)
+python debug_test_recurrent.py --no-backward
 ```
-Example:
+
+Expected output: `max_grad_r2` on the order of 1e-13 (fp32), 0 params skipped.
+
+## Benchmarking block latency
+
+`benchmark_block_latencies.py` measures per-block forward (and optionally backward) latency across sequence lengths, batch sizes, and block types. Outputs a CSV.
+
 ```bash
-python scripts/train.py configs/tiny/OLMo-20M.yaml --save_overwrite
-```
-> Note: You need to upgrade PyTorch to 2.5.x to run.
+# Default sweep: recurrent vs recurrent_autograd vs sequential
+python benchmark_block_latencies.py
 
-### Stage 1
-
-Stage 1 is the biggest stage, where we train on 4T or 5T tokens on largely web-based data. 
-
-|                 | OLMo2 1B                                                                                                          | OLMo2 7B                                                                                                          | OLMo2 13B                                                                                                          |
-|-----------------|-----------------|-------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| Number of tokens| 4 Trillion | 4 Trillion                                                                                                        | 5 Trillion                                                                                                         |
-| Checkpoint      |[stage1-step1907359-tokens4001B](https://huggingface.co/allenai/OLMo-2-0425-1B/tree/stage1-step1907359-tokens4001B)| [stage1-step928646-tokens3896B](https://huggingface.co/allenai/OLMo-2-1124-7B/tree/stage1-step928646-tokens3896B) | [stage1-step596057-tokens5001B](https://huggingface.co/allenai/OLMo-2-1124-13B/tree/stage1-step596057-tokens5001B) |
-| Training config | [OLMo2-1B-stage1.yaml](configs/official-0425/OLMo2-1B-stage1.yaml) |[OLMo2-7B-stage1.yaml](configs/official-1124/OLMo2-7B-stage1.yaml)                                                | [OLMo2-13B-stage1.yaml](configs/official-1124/OLMo2-13B-stage1.yaml)                                               |                                              |
-| WandB           | [wandb.ai/OLMo2-1B](https://api.wandb.ai/links/ai2-llm/izdtrtu0)|[wandb.ai/OLMo2-7B](https://wandb.ai/ai2-llm/OLMo-2-1124-7B/reports/OLMo-2-7B-Nov-2024--VmlldzoxMDUzMzE1OA)       | [wandb.ai/OLMo2-13B](https://wandb.ai/ai2-llm/OLMo-2-1124-13B/reports/OLMo-2-13B-Nov-2024--VmlldzoxMDUzMjQxNg) |
-
-You can find the .csv.gz files containing the training data [here](configs/official-1124/provenance.csv).
-
-### Stage 2 for the 1B
-
-For the 1B model, we have trained three times with different data order on 50B high quality tokens, used last checkpoint of seed 42 as final checkpoint.
-
-|                        | Checkpoint                                                                                                                          | Training config                                                                        | WandB       |
-|------------------------|-------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|-------------|
-| random seed 42069         | [stage2-ingredient1-step23852-tokens50B](https://huggingface.co/allenai/OLMo-2-0425-1B/tree/stage2-ingredient1-step23852-tokens51B) | [OLMo2-1B-stage2-seed42069.yaml](configs/official-0425/OLMo2-1B-stage2-seed42069.yaml)       | [wandb.ai/OLMo2-1B](https://api.wandb.ai/links/ai2-llm/izdtrtu0) |
-| random seed 666      | [stage2-ingredient2-step23852-tokens50B](https://huggingface.co/allenai/OLMo-2-0425-1B/tree/stage2-ingredient2-step23852-tokens51B) | [OLMo2-1B-stage2-seed666.yaml](configs/official-0425/OLMo2-1B-stage2-seed666.yaml) | [wandb.ai/OLMo2-1B](https://api.wandb.ai/links/ai2-llm/izdtrtu0) |
-| random seed 42  (main)      | [stage2-ingredient3-step23852-tokens50B](https://huggingface.co/allenai/OLMo-2-0425-1B/tree/stage2-ingredient3-step23852-tokens51B) | [OLMo2-1B-stage2-seed42.yaml](configs/official-0425/OLMo2-1B-stage2-seed42.yaml)     | [wandb.ai/OLMo2-1B](https://api.wandb.ai/links/ai2-llm/izdtrtu0) |
-
-
-### Stage 2 for the 7B
-
-For the 7B model, we train three times with different data order on 50B high quality tokens, and then average ("soup") the models.
-
-|                        | Checkpoint                                                                                                                          | Training config                                                                        | WandB       |
-|------------------------|-------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|-------------|
-| random seed 42         | [stage2-ingredient1-step11931-tokens50B](https://huggingface.co/allenai/OLMo-2-1124-7B/tree/stage2-ingredient1-step11931-tokens50B) | [OLMo2-7B-stage2-seed42.yaml](configs/official-1124/OLMo2-7B-stage2-seed42.yaml)       | [wandb.ai/OLMo2-7B](https://wandb.ai/ai2-llm/OLMo-2-1124-7B/reports/) |
-| random seed 42069      | [stage2-ingredient2-step11931-tokens50B](https://huggingface.co/allenai/OLMo-2-1124-7B/tree/stage2-ingredient2-step11931-tokens50B) | [OLMo2-7B-stage2-seed42069.yaml](configs/official-1124/OLMo2-7B-stage2-seed42069.yaml) | [wandb.ai/OLMo2-7B](https://wandb.ai/ai2-llm/OLMo-2-1124-7B/reports/) |
-| random seed 666        | [stage2-ingredient3-step11931-tokens50B](https://huggingface.co/allenai/OLMo-2-1124-7B/tree/stage2-ingredient3-step11931-tokens50B) | [OLMo2-7B-stage2-seed666.yaml](configs/official-1124/OLMo2-7B-stage2-seed666.yaml)     | [wandb.ai/OLMo2-7B](https://wandb.ai/ai2-llm/OLMo-2-1124-7B/reports/) |
-| **final souped model** | [main](https://huggingface.co/allenai/OLMo-2-1124-7B/tree/main) | no config, we just averaged the weights in Python                                      | |
-
-The training configs linked here are set up to download the latest checkpoint after stage 1, and start training from there.
-
-### Stage 2 for the 13B
-
-For the 13B model, we train three times with different data order on 100B high quality tokens, and one more time
-on 300B high quality tokens. Then we average ("soup") the models.
-
-|                        | Checkpoint                                                                                                                             | Training config                                                                                  | WandB       |
-|------------------------|----------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|-------------|
-| random seed 1110, 100B | [stage2-ingredient1-step11931-tokens100B](https://huggingface.co/allenai/OLMo-2-1124-13B/tree/stage2-ingredient1-step11931-tokens100B) | [OLMo2-13B-stage2-seed1110-100B.yaml](configs/official-1124/OLMo2-13B-stage2-seed1110-100B.yaml) | [wandb.ai/OLMo2-13B](https://wandb.ai/ai2-llm/OLMo-2-1124-13B/reports/OLMo-2-13B-Nov-2024--VmlldzoxMDUzMjQxNg) |
-| random seed 2662, 100B | [stage2-ingredient2-step11931-tokens100B](https://huggingface.co/allenai/OLMo-2-1124-13B/tree/stage2-ingredient2-step11931-tokens100B) | [OLMo2-13B-stage2-seed2662-100B.yaml](configs/official-1124/OLMo2-13B-stage2-seed2662-100B.yaml) | [wandb.ai/OLMo2-13B](https://wandb.ai/ai2-llm/OLMo-2-1124-13B/reports/OLMo-2-13B-Nov-2024--VmlldzoxMDUzMjQxNg) |
-| random seed 6209, 100B | [stage2-ingredient3-step11931-tokens100B](https://huggingface.co/allenai/OLMo-2-1124-13B/tree/stage2-ingredient3-step11931-tokens100B) | [OLMo2-13B-stage2-seed6209-100B.yaml](configs/official-1124/OLMo2-13B-stage2-seed6209-100B.yaml) | [wandb.ai/OLMo2-13B](https://wandb.ai/ai2-llm/OLMo-2-1124-13B/reports/OLMo-2-13B-Nov-2024--VmlldzoxMDUzMjQxNg) |
-| random seed 2662, 300B | [stage2-ingredient4-step11931-tokens300B](https://huggingface.co/allenai/OLMo-2-1124-13B/tree/stage2-ingredient4-step35773-tokens300B) | [OLMo2-13B-stage2-seed2662-300B.yaml](configs/official-1124/OLMo2-13B-stage2-seed2662-300B.yaml) | [wandb.ai/OLMo2-13B](https://wandb.ai/ai2-llm/OLMo-2-1124-13B/reports/OLMo-2-13B-Nov-2024--VmlldzoxMDUzMjQxNg) |
-| **final souped model** | [main](https://huggingface.co/allenai/OLMo-2-1124-13B/tree/main)                                                                       | no config, we just averaged the weights in Python                                                | |
-
-The training configs linked here are set up to download the latest checkpoints after stage 1, and start training from there.
-
-> Note: You can find all the information about the 32B in the [OLMo-core](https://github.com/allenai/OLMo-core) repository.
-
-## Instruction tuned variants
-
-For instruction tuned variants of these models, go to
- * [OLMo2 1B Instruct](https://huggingface.co/allenai/OLMo-2-0425-1B-Instruct)
- * [OLMo2 7B Instruct](https://huggingface.co/allenai/OLMo-2-1124-7B-Instruct)
- * [OLMo2 13B Instruct](https://huggingface.co/allenai/OLMo-2-1124-13B-Instruct)
- * [OLMo2 32B Instruct](https://huggingface.co/allenai/OLMo-2-0325-32B-Instruct)
-
-## Inference
-
-You can use our Hugging Face integration to run inference on the OLMo Transformers checkpoints:
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-olmo = AutoModelForCausalLM.from_pretrained("allenai/OLMo-2-0425-1B")
-tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-2-0425-1B")
-message = ["Language modeling is "]
-inputs = tokenizer(message, return_tensors='pt', return_token_type_ids=False)
-# optional verifying cuda
-# inputs = {k: v.to('cuda') for k,v in inputs.items()}
-# olmo = olmo.to('cuda')
-response = olmo.generate(**inputs, max_new_tokens=100, do_sample=True, top_k=50, top_p=0.95)
-print(tokenizer.batch_decode(response, skip_special_tokens=True)[0])
+# Specific configuration
+python benchmark_block_latencies.py \
+    --modes recurrent sequential \
+    --seq-lens 128 256 512 1024 \
+    --batch-sizes 256 512 \
+    --d-model 1024 --n-heads 16 \
+    --backwards \
+    --alibi
 ```
 
-Alternatively, with the Hugging Face pipeline abstraction:
+Results are written to `block_implementation_latencies.csv`.
 
-```python
-from transformers import pipeline
-olmo_pipe = pipeline("text-generation", model="allenai/OLMo-2-0425-1B")
-print(olmo_pipe("Language modeling is"))
+## Repository structure
+
 ```
+olmo/
+  config.py          # TrainConfig, ModelConfig, BlockType, CudaGraphMode
+  model.py           # OLMoBlock hierarchy, OLMoRecurrentBlockTiled, OLMoRecurrentAutogradBlock,
+                     #   OLMoRecurrentBlockTiledFunction (custom autograd)
+  efficient_utils.py # CUDA graph capture, benchmarking helpers, alibi_attention_bias
 
-### Quantization
+configs/kempner/
+  base-c4-t5.yaml    # Base training config (optimizer, data paths, eval)
+  models/            # Model-size overlays (150m, 300m)
 
-```python
-olmo = AutoModelForCausalLM.from_pretrained("allenai/OLMo-2-0425-1B", torch_dtype=torch.float16, load_in_8bit=True)  # requires bitsandbytes
-```
+sweep_*.yaml         # Sweep configs for hyperparameter grids
 
-The quantized model is sensitive to input types and CUDA handling. To avoid potential issues, we recommend explicitly converting input IDs to CUDA using: `inputs.input_ids.to('cuda')`
+scripts/
+  train.py                   # Training entrypoint
+  kempner/launch_sweep.sh    # SLURM job template
+  kempner/run_sweep.py       # Sweep grid expansion + launch
 
-## Evaluation
-
-Additional tools for evaluating OLMo models are available at the [OLMo Eval](https://github.com/allenai/OLMo-eval) and [olmes](https://github.com/allenai/olmes) repositories.
-
-## Modal.com Hosting
-
-An example script is provided for hosting an OLMo 2 model on Modal.com using the OpenAI API in `./scripts/olmo2_modal_openai.py`.
-To run that:
-
-1. Follow the instructions under Getting Started in [the Modal.com Guide](https://modal.com/docs/guide) to install
-the Modal library and command line tools.</li>
-2. Follow the instructions under [Secrets](https://modal.com/docs/guide/secrets) in the Modal.com Guide to create a Modal secret named "example-secret-token"
-that defines a value for the variable MODAL_TOKEN for your server.</li>
-3. Then run
-```bash
-modal deploy ./scripts/olmo2_modal_openai.py
-```
-
-You can check your endpoint using curl similar to the following:
-```bash
-curl -X POST \
-  -H "Authorization: Bearer [the secret token from above]" \
-  -H "Content-Type: application/json" \
-  -d @body.json \
-  https://[the web endpoint modal creates above]/v1/chat/completions
-```
-
-where `body.json` is of the form:
-```
-{
-    "model": "OLMo-2-1124-13B-Instruct",
-    "messages": [
-        {
-            "role": "user",
-            "content": "Who was Alan Turing?"
-        }
-      ],
-    "max_tokens": 100,
-    "temperature": 0.9,
-    "stream": true
-}
-```
-
-
-## Citing
-
-```bibtex
-@misc{olmo20242olmo2furious,
-      title={2 OLMo 2 Furious}, 
-      author={Team OLMo and Pete Walsh and Luca Soldaini and Dirk Groeneveld and Kyle Lo and Shane Arora and Akshita Bhagia and Yuling Gu and Shengyi Huang and Matt Jordan and Nathan Lambert and Dustin Schwenk and Oyvind Tafjord and Taira Anderson and David Atkinson and Faeze Brahman and Christopher Clark and Pradeep Dasigi and Nouha Dziri and Michal Guerquin and Hamish Ivison and Pang Wei Koh and Jiacheng Liu and Saumya Malik and William Merrill and Lester James V. Miranda and Jacob Morrison and Tyler Murray and Crystal Nam and Valentina Pyatkin and Aman Rangapur and Michael Schmitz and Sam Skjonsberg and David Wadden and Christopher Wilhelm and Michael Wilson and Luke Zettlemoyer and Ali Farhadi and Noah A. Smith and Hannaneh Hajishirzi},
-      year={2024},
-      eprint={2501.00656},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2501.00656}, 
-}
+debug_test_recurrent.py      # Numerical equivalence test
+debug_utils.py               # Model creation, weight transfer, comparison helpers
+benchmark_block_latencies.py # Block latency profiling
 ```

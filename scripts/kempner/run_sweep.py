@@ -75,7 +75,11 @@ def run(cli_args):
         f"--save_folder={checkpoints_path}/{slurm_job_id}_{slurm_task_id}/",
     ]
     for k, v in overrides.items():
-        launch_args.append(f"--{k}={v}")
+        if v is None:
+            launch_args.append(f"--{k}=null")
+        else:
+            launch_args.append(f"--{k}={v}")
+    print(launch_args)
 
     if "debug" in cli_args:
         launch_args.append("--wandb=null")
