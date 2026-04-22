@@ -1,0 +1,17 @@
+max_duration: 50000 # 6.6B tokens / (256 batch * 512 context) (20x number of parameters) 
+
+scheduler:
+  t_warmup: 5000
+
+device_train_microbatch_size: 64 # For H100 with adam
+
+model:
+  # 301m non-embedding params and 368m total params
+  d_model: 1024
+  n_heads: 16
+  mlp_hidden_size: 4096
+  n_layers: 24
+
+# Memory: 44GB
+# 160k tokens / sec or 1.2 batches / sec
+# ~6 hrs per run

@@ -1,0 +1,21 @@
+# 18 jobs 
+sweep:
+  - device_train_microbatch_size: 32
+    epochs: 1
+    wandb:
+      group: 150m_adam_rms
+    optimizer:
+      name: adamw
+      learning_rate: [1.0e-3, 3.0e-3]
+      beta_0: 0.9 # [0.8, 0.9, 0.95]
+      beta_1: 0.95
+      eps: [1.0e-8]
+      decouple_weight_decay: false
+      weight_decay: 0.0
+      decay_norm_and_bias: [true, false]
+      decay_embeddings: true
+      metrics_log_interval: 100
+    model:
+      layer_norm_type: rms
+      layer_norm_with_affine: [true, false]
+      layer_norm_eps: [1.0e-5, 1.0e-10]

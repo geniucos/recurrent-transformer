@@ -1,0 +1,24 @@
+# 18 jobs 
+sweep:
+  - device_train_microbatch_size: 32
+    global_train_batch_size: 256
+    num_passes: 1
+    wandb:
+      group: fixed_separate_lrs_rotated_adamw_sweep 
+    optimizer:
+      name: [rotatedadamw, blockwiseadamw]
+      learning_rate: [1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1]
+      learning_rate2: [1.0e-3, 3.0e-3, 1.0e-2, 3.0e-2, 1.0e-1]
+      beta_0: 0.9 
+      beta_1: 0.95
+      eps: 1.0e-8
+      decouple_weight_decay: true
+      weight_decay: 0.0
+      decay_norm_and_bias: true
+      decay_embeddings: true
+      metrics_log_interval: 100
+    scheduler:
+      name: "cosine_with_warmup"
+      t_warmup: 1250
+    max_duration: 12500
+    stop_at: 12500
